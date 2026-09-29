@@ -14,3 +14,4 @@ cargo install --git https://github.com/usagi-coffee/tree-trimmer
 tree-trimmer src/parser.c
 ```
 
+Uses available CPUs, up to 8 workers. Set `--jobs N` to override; `--jobs 1` runs serially.

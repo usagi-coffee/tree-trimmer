@@ -54,12 +54,15 @@ fn run() -> Result<(), String> {
     let mut args = Vec::new();
     let mut rounds = 4;
     let mut timings = false;
+    let mut jobs = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
     let mut cli = env::args().skip(1);
     while let Some(arg) = cli.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: tree-trimmer INPUT.c [-o OUTPUT.c] [--cc COMPILER] [--cpp-arg ARG] [--rounds N] [--timings]\n\nCompress generated Tree-sitter C in place, or into OUTPUT.c when given.\nAlways verifies identical preprocessed tokens and C syntax before an atomic write.\nPass include paths and build defines with repeated --cpp-arg arguments.\nUse --rounds 0 for verified whitespace-only minification. CC defaults to cc.\nUse --timings to report time spent in each stage."
+                    "Usage: tree-trimmer INPUT.c [-o OUTPUT.c] [--cc COMPILER] [--cpp-arg ARG] [--rounds N] [--jobs N] [--timings]\n\nCompress generated Tree-sitter C in place, or into OUTPUT.c when given.\nAlways verifies identical preprocessed tokens and C syntax before an atomic write.\nPass include paths and build defines with repeated --cpp-arg arguments.\nUse --rounds 0 for verified whitespace-only minification. CC defaults to cc.\nUse --jobs N to set parallel workers (default: available CPUs, up to 8).\nUse --jobs 1 for serial execution; --timings reports each stage."
                 );
                 return Ok(());
             }
@@ -67,6 +70,16 @@ fn run() -> Result<(), String> {
             "--cc" => cc = cli.next().ok_or("missing compiler")?,
             "--cpp-arg" => args.push(cli.next().ok_or("missing compiler argument")?),
             "--timings" => timings = true,
+            "--jobs" => {
+                jobs = cli
+                    .next()
+                    .ok_or("missing jobs")?
+                    .parse::<usize>()
+                    .map_err(|_| "invalid jobs")?;
+                if jobs == 0 {
+                    return Err("jobs must be greater than zero".into());
+                }
+            }
             "--rounds" => {
                 rounds = cli
                     .next()
@@ -109,21 +122,28 @@ fn run() -> Result<(), String> {
     }
     let parent = input.parent().unwrap();
     let mut stage = Instant::now();
-    eprintln!("Compressing {} bytes; checking with {cc}...", source.len());
-    let expanded = compiler(&cc, &args, &source, parent, &["-E", "-P"])?;
-    report_time(timings, "Preprocess original", &mut stage);
-    let macros = compiler(&cc, &args, &source, parent, &["-E", "-dM"])?;
-    report_time(timings, "Read compiler macros", &mut stage);
-    let result = tree_trimmer::compress_with_reserved(&source, &[&expanded, &macros], rounds)?;
+    eprintln!(
+        "Compressing {} bytes with {jobs} worker(s); checking with {cc}...",
+        source.len()
+    );
+    let (expanded, macros) = parallel_pair(
+        jobs > 1,
+        || compiler(&cc, &args, &source, parent, &["-E", "-P"]),
+        || compiler(&cc, &args, &source, parent, &["-E", "-dM"]),
+    )?;
+    report_time(timings, "Preprocess original and read macros", &mut stage);
+    let result = tree_trimmer::compress_with_jobs(&source, &[&expanded, &macros], rounds, jobs)?;
     report_time(timings, "Compress", &mut stage);
-    let check = compiler(&cc, &args, &result.source, parent, &["-E", "-P"])?;
-    report_time(timings, "Preprocess minified", &mut stage);
-    tree_trimmer::equivalent(&expanded, &check)?;
-    report_time(timings, "Compare tokens", &mut stage);
-    drop(check);
+    parallel_pair(
+        jobs > 1,
+        || {
+            let check = compiler(&cc, &args, &result.source, parent, &["-E", "-P"])?;
+            tree_trimmer::equivalent(&expanded, &check)
+        },
+        || compiler(&cc, &args, &result.source, parent, &["-fsyntax-only"]),
+    )?;
+    report_time(timings, "Verify tokens and C syntax", &mut stage);
     drop(expanded);
-    compiler(&cc, &args, &result.source, parent, &["-fsyntax-only"])?;
-    report_time(timings, "Check C syntax", &mut stage);
     if output == input && fs::read_to_string(&input).map_err(|e| e.to_string())? != source {
         return Err("input changed during compression; output was not written".into());
     }
@@ -140,6 +160,24 @@ fn run() -> Result<(), String> {
         output.display()
     );
     Ok(())
+}
+
+fn parallel_pair<A: Send, B: Send>(
+    parallel: bool,
+    left: impl FnOnce() -> Result<A, String>,
+    right: impl FnOnce() -> Result<B, String> + Send,
+) -> Result<(A, B), String> {
+    if !parallel {
+        return Ok((left()?, right()?));
+    }
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(right);
+        let a = left();
+        // Join even if the first operation failed. Both checks must finish
+        // successfully before the caller can write anything.
+        let b = worker.join().map_err(|_| "compiler worker panicked")?;
+        Ok((a?, b?))
+    })
 }
 
 fn report_time(enabled: bool, label: &str, stage: &mut Instant) {

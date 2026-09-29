@@ -183,6 +183,33 @@ fn cli_separate_output_and_defines() {
 }
 
 #[test]
+fn cli_jobs_produce_identical_output_and_reject_zero() {
+    let source = parser();
+    let fixture = Fixture::new(&source);
+    let mut previous = None;
+    for jobs in ["1", "2", "4"] {
+        let output = fixture.0.join(format!("jobs-{jobs}.c"));
+        let run = fixture.run(&["-o", output.to_str().unwrap(), "--jobs", jobs]);
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let result = fs::read(&output).unwrap();
+        if let Some(previous) = &previous {
+            assert_eq!(&result, previous);
+        }
+        previous = Some(result);
+    }
+    assert!(!fixture.run(&["--jobs", "0"]).status.success());
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("parser.c")).unwrap(),
+        source
+    );
+    assert!(tree_trimmer::compress_with_jobs(&source, &[], 4, 0).is_err());
+}
+
+#[test]
 fn failures_leave_input_and_output_untouched() {
     for source in [
         "#include \"tree_sitter/parser.h\"\nint x = __LINE__;",
@@ -191,7 +218,7 @@ fn failures_leave_input_and_output_untouched() {
         let fixture = Fixture::new(source);
         let output = fixture.0.join("min.c");
         fs::write(&output, "existing output").unwrap();
-        assert!(!fixture.run(&[]).status.success());
+        assert!(!fixture.run(&["--jobs", "2"]).status.success());
         assert!(
             !fixture
                 .run(&["-o", output.to_str().unwrap()])
@@ -216,7 +243,7 @@ fn stringification_changes_are_rejected_before_writing() {
     }
     source.push_str("return very_long_identifier; }\n");
     let fixture = Fixture::new(&source);
-    let run = fixture.run(&[]);
+    let run = fixture.run(&["--jobs", "2"]);
     assert!(!run.status.success());
     assert!(
         String::from_utf8_lossy(&run.stderr).contains("equivalence failed"),

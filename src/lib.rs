@@ -263,6 +263,19 @@ pub fn compress_with_reserved(
     reserved: &[&str],
     rounds: usize,
 ) -> Result<Compressed, String> {
+    compress_with_jobs(source, reserved, rounds, 1)
+}
+
+/// Select the number of parallel search workers. Output is independent of jobs.
+pub fn compress_with_jobs(
+    source: &str,
+    reserved: &[&str],
+    rounds: usize,
+    jobs: usize,
+) -> Result<Compressed, String> {
+    if jobs == 0 {
+        return Err("jobs must be greater than zero".into());
+    }
     let source = prepare(source)?;
     let occupied: HashSet<&str> = std::iter::once(source.as_ref())
         .chain(reserved.iter().copied())
@@ -290,7 +303,7 @@ pub fn compress_with_reserved(
     let mut definitions: Vec<(String, Vec<u32>)> = Vec::new();
     let mut serial = 0;
     for _ in 0..rounds {
-        let candidates = candidates(&body, &vocabulary);
+        let candidates = candidates(&body, &vocabulary, jobs);
         if candidates.is_empty() {
             break;
         }
@@ -450,9 +463,64 @@ fn sequence_len(seq: &[u32], vocabulary: &[Token]) -> usize {
         .len()
 }
 
-fn candidates(body: &[u32], vocabulary: &[Token]) -> Vec<Vec<u32>> {
+fn candidates(body: &[u32], vocabulary: &[Token], jobs: usize) -> Vec<Vec<u32>> {
+    // Small inputs cost more to distribute than to scan directly.
+    let jobs = jobs.min(body.len() / 262_144).min(vocabulary.len());
+    let ranked = if jobs <= 1 {
+        candidates_at(body, vocabulary, 0..body.len())
+    } else {
+        parallel_candidates(body, vocabulary, jobs)
+    };
+    ranked.into_iter().map(|(_, seq)| seq.to_vec()).collect()
+}
+
+fn parallel_candidates<'a>(
+    body: &'a [u32],
+    vocabulary: &[Token],
+    jobs: usize,
+) -> Vec<(isize, &'a [u32])> {
+    // All occurrences of a sequence go to the same worker, selected by
+    // its first token. This preserves the serial non-overlapping counts,
+    // including matches spanning any input partition boundary.
+    let mut frequencies = vec![0usize; vocabulary.len()];
+    for &id in body {
+        frequencies[id as usize] += 1;
+    }
+    let mut tokens: Vec<_> = (0..vocabulary.len()).collect();
+    tokens.sort_unstable_by_key(|&id| (std::cmp::Reverse(frequencies[id]), id));
+    let mut loads = vec![0; jobs];
+    let mut owners = vec![0; vocabulary.len()];
+    for id in tokens {
+        let owner = (0..jobs).min_by_key(|&job| loads[job]).unwrap();
+        owners[id] = owner;
+        loads[owner] += frequencies[id];
+    }
+    let mut starts: Vec<Vec<usize>> = loads.into_iter().map(Vec::with_capacity).collect();
+    for (start, &id) in body.iter().enumerate() {
+        starts[owners[id as usize]].push(start);
+    }
+    let ranked = std::thread::scope(|scope| {
+        let workers: Vec<_> = starts
+            .into_iter()
+            .map(|starts| scope.spawn(move || candidates_at(body, vocabulary, starts.into_iter())))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("candidate worker panicked"))
+            .collect()
+    });
+    // Each shard contributes its best 256; none of its remaining candidates
+    // can occur in the global top 256. The tie breaker is deterministic.
+    top_candidates(ranked)
+}
+
+fn candidates_at<'a>(
+    body: &'a [u32],
+    vocabulary: &[Token],
+    starts: impl Iterator<Item = usize>,
+) -> Vec<(isize, &'a [u32])> {
     let mut counts: HashMap<&[u32], (usize, usize)> = HashMap::new();
-    for start in 0..body.len() {
+    for start in starts {
         if vocabulary[body[start] as usize].text == "(" {
             continue;
         }
@@ -503,7 +571,7 @@ fn candidates(body: &[u32], vocabulary: &[Token]) -> Vec<Vec<u32>> {
             }
         }
     }
-    let mut candidates: Vec<_> = counts
+    let candidates: Vec<_> = counts
         .into_iter()
         .filter_map(|(seq, (count, _))| {
             if count < 2 {
@@ -514,6 +582,10 @@ fn candidates(body: &[u32], vocabulary: &[Token]) -> Vec<Vec<u32>> {
             (savings > 0).then_some((savings, seq))
         })
         .collect();
+    top_candidates(candidates)
+}
+
+fn top_candidates(mut candidates: Vec<(isize, &[u32])>) -> Vec<(isize, &[u32])> {
     let order = |a: &(isize, &[u32]), b: &(isize, &[u32])| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
     if candidates.len() > 256 {
         candidates.select_nth_unstable_by(256, order);
@@ -521,9 +593,6 @@ fn candidates(body: &[u32], vocabulary: &[Token]) -> Vec<Vec<u32>> {
     }
     candidates.sort_unstable_by(order);
     candidates
-        .into_iter()
-        .map(|(_, seq)| seq.to_vec())
-        .collect()
 }
 
 /// Compare every preprocessing token without allocating token strings or vectors.
@@ -552,6 +621,30 @@ pub fn equivalent(a: &str, b: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_candidate_counts_and_ranking_match_serial() {
+        let mut vocabulary: Vec<_> = (0..400)
+            .map(|n| Token {
+                text: format!("generated_symbol_{n}"),
+                directive: false,
+            })
+            .collect();
+        vocabulary.extend(tokenize("; if(x) f(123); [4] {1,2} #").unwrap());
+        let mut body: Vec<u32> = (0..400).cycle().take(2400).collect();
+        // Dense self-overlap exercises the greedy non-overlapping counts.
+        body.extend([0, 1, 0, 1, 0, 1, 0].repeat(300));
+        body.extend((400..vocabulary.len() as u32).cycle().take(2000));
+        let expected = candidates_at(&body, &vocabulary, 0..body.len());
+        assert_eq!(expected.len(), 256);
+        for jobs in [2, 3, 4, 8] {
+            assert_eq!(
+                parallel_candidates(&body, &vocabulary, jobs),
+                expected,
+                "jobs={jobs}"
+            );
+        }
+    }
 
     #[test]
     fn indexed_replacement_matches_full_scan_with_overlapping_candidates() {
