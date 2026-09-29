@@ -52,17 +52,15 @@ fn run() -> Result<(), String> {
     let mut output: Option<PathBuf> = None;
     let mut cc = env::var("CC").unwrap_or_else(|_| "cc".into());
     let mut args = Vec::new();
-    let mut rounds = 16;
+    let mut rounds = 64;
     let mut timings = false;
-    let mut jobs = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(8);
+    let mut jobs = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut cli = env::args().skip(1);
     while let Some(arg) = cli.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: tree-trimmer INPUT.c [-o OUTPUT.c] [--cc COMPILER] [--cpp-arg ARG] [--rounds N] [--jobs N] [--timings]\n\nCompress generated Tree-sitter C in place, or into OUTPUT.c when given.\nAlways verifies identical preprocessed tokens and C syntax before an atomic write.\nPass include paths and build defines with repeated --cpp-arg arguments.\nUse --rounds N to set search rounds (default: 16); 0 removes whitespace only. CC defaults to cc.\nUse --jobs N to set parallel workers (default: available CPUs, up to 8).\nUse --jobs 1 for serial execution; --timings reports each stage."
+                    "Usage: tree-trimmer INPUT.c [-o OUTPUT.c] [--cc COMPILER] [--cpp-arg ARG] [--rounds N] [--jobs N] [--timings]\n\nCompress generated Tree-sitter C in place, or into OUTPUT.c when given.\nAlways verifies identical preprocessed tokens and C syntax before an atomic write.\nPass include paths and build defines with repeated --cpp-arg arguments.\nUse --rounds N to set search rounds (default: 64); 0 removes whitespace only. CC defaults to cc.\nUse --jobs N to set parallel workers (default: all available CPUs).\nUse --jobs 1 for serial execution; --timings reports each stage."
                 );
                 return Ok(());
             }

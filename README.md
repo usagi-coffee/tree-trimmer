@@ -14,4 +14,4 @@ cargo install --git https://github.com/usagi-coffee/tree-trimmer
 tree-trimmer src/parser.c
 ```
 
-Defaults to 16 rounds and up to 8 workers. Override with `--rounds N` and `--jobs N`.
+Defaults to 64 rounds and all available CPUs. Override with `--rounds N` and `--jobs N`.
