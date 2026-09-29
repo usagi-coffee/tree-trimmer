@@ -1,0 +1,10 @@
+[package]
+name = "tree-trimmer"
+version = "0.1.0"
+edition = "2024"
+description = "Verified source compression for generated Tree-sitter C parsers"
+license = "MIT"
+
+[profile.release]
+lto = true
+strip = true
