@@ -41,6 +41,28 @@ fn verification_checks_literals_and_pragmas() {
     assert!(equivalent("char*s=\"a b\";", "char*s=\"ab\";").is_err());
     assert!(equivalent("#pragma pack(1)\nint x;", "int x;").is_err());
     assert!(equivalent("int x;", "int x; int y;").is_err());
+    assert!(equivalent("int x; int y;", "int x;").is_err());
+    assert!(equivalent("int x; /* unterminated", "int x;").is_err());
+    equivalent("int vari\\\nable;", "int variable;").unwrap();
+}
+
+#[test]
+fn verification_detects_a_change_at_the_end_of_large_input() {
+    let source = "{123,456},\n".repeat(100_000);
+    equivalent(&source, &source.replace('\n', "")).unwrap();
+    assert!(equivalent(&source, &format!("{source}0")).is_err());
+    assert!(equivalent(&format!("{source}0"), &source).is_err());
+}
+
+#[test]
+fn separate_reserved_buffers_and_spliced_names_avoid_collisions() {
+    let source = parser();
+    let combined = compress(&source, "a b c d e f", 4).unwrap();
+    let split = tree_trimmer::compress_with_reserved(&source, &["a b", "c d e f"], 4).unwrap();
+    assert_eq!(combined.source, split.source);
+    let source = format!("int a\\\na;\n{source}");
+    let result = compress(&source, "", 4).unwrap();
+    assert!(!result.source.contains("#define aa "));
 }
 
 fn parser() -> String {
